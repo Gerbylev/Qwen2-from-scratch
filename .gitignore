@@ -1,0 +1,34 @@
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+
+test_at_time_*/
+server/data/
+### VS Code ###
+.vscode/
+
+### Local artifacts ###
+.venv
+version-info.json
+config-local.yml
+server/src/cyntai/endpoints/apis
+server/src/cyntai/endpoints/models
+server/src/cyntai/endpoints/router_init.py
+node_modules
+vast
+instance_id.json
+build
+__pycache__
+.~lock.*
+.coverage
+rec_*.xlsx
+pytest-report
+htmlcov/
+.coverage
+matching_response/
+no_human_bench
+.ipynb_checkpoints
+.aider*
+.env
