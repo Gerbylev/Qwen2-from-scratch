@@ -1,9 +1,8 @@
-from dataclasses import dataclass
+from typing import Callable
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from models.conf import ModelConfig
 from models.base import BaseModel
 
@@ -153,35 +152,47 @@ class Qwen2(nn.Module, BaseModel):
         if not config.tie_word_embeddings:
             self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False)
 
-    def _get_position_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _get_position_ids(input_ids: torch.Tensor) -> torch.Tensor:
         B, T = input_ids.shape
         device = input_ids.device
         position_ids = torch.arange(T, dtype=torch.long, device=device)
         position_ids = position_ids.unsqueeze(0).expand(B, -1)
         return position_ids
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor, kv_cache=None, targets=None):
         x = self.model.embed_tokens(input_ids)
         position_ids = self._get_position_ids(input_ids)
         cos, sin = self.model.rotary_emb(x, position_ids)
-        for layer in self.model.layers:
-            x = layer(x, cos, sin)
+
+        new_kv_cache = [] if kv_cache is None else kv_cache
+        for i, layer in enumerate(self.model.layers):
+            past_key_value = None if kv_cache is None else kv_cache[i]
+            x, past_key_value = layer(x, cos, sin, past_key_value)
+            new_kv_cache.append(past_key_value)
+
         x = self.model.norm(x)
+
         if self.lm_head is None:
             logits = torch.matmul(x, self.model.embed_tokens.weight.T)
         else:
             logits = self.lm_head(x)
-        return logits
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+        return logits, new_kv_cache, loss
 
     def generate(
-        self, input_ids: torch.Tensor, max_new_tokens: int = 1, use_cache=True
+        self, input_ids: torch.Tensor, callback: Callable[[int], bool]= None, max_new_tokens: int = 1000, use_cache=True
     ) -> torch.Tensor:
         cache = [None] * len(self.model.layers)
         for _ in range(max_new_tokens):
             x = self.model.embed_tokens(input_ids)
             position_ids = self._get_position_ids(input_ids)
             cos, sin = self.model.rotary_emb(x, position_ids)
-            new_cache = []
+            new_cache = [None] * len(self.model.layers)
             for layer, layer_cache in zip(self.model.layers, cache):
                 layer_cache = self._get_kv_cache(layer_cache, x.device)
                 x, present = layer(x, cos, sin, layer_cache, use_cache)
@@ -196,15 +207,19 @@ class Qwen2(nn.Module, BaseModel):
             probs = F.softmax(last_logits, dim=-1)
             next_token = probs.argmax(dim=-1, keepdim=True)
             input_ids = torch.cat([input_ids, next_token], dim=1)
+            if callback is not None:
+                if callback(next_token):
+                    return input_ids
         return input_ids
 
     @staticmethod
     def _set_kv_cache(past_cache, new_tensor):
-        present = (
-            new_tensor[0].detach().cpu(),
-            new_tensor[1].detach().cpu()
-        )
-        past_cache.append(present)
+        if new_tensor is not None:
+            present = (
+                new_tensor[0].detach().cpu(),
+                new_tensor[1].detach().cpu()
+            )
+            past_cache.append(present)
 
     @staticmethod
     def _get_kv_cache(past_cache, device):
