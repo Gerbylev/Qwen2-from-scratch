@@ -1,12 +1,21 @@
-from typing import Callable
+import logging
+from dataclasses import dataclass
+from typing import Callable, Optional, List
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.conf import ModelConfig
-from models.base import BaseModel
+from sympy.physics.units import current
 
+from model.conf import ModelConfig
+from model.base import BaseModel
 
+log = logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
+@dataclass
+class Cache:
+    key_cache: torch.Tensor
+    value_cache: torch.Tensor
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, config):
@@ -43,12 +52,12 @@ class CausalSelfAttention(nn.Module):
         self.v_proj = nn.Linear(self.n_embed, self.n_kv_embed, bias=True)
         self.o_proj = nn.Linear(self.n_embed, self.n_embed, bias=False)
 
-    def forward(self, x, cos, sin, past_key_value=None, use_cache=False):
+    def forward(self, x, cos, sin, past_cache, use_cache):
         B, T, C = x.size()
 
         q = self.q_proj(x)
 
-        if past_key_value is not None:
+        if past_cache is not None:
             x_kv = x[:, -1:, :]
         else:
             x_kv = x
@@ -61,28 +70,27 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, v.size(1), self.n_kv_heads, self.n_embed_per_head).transpose(1, 2)
 
         q = self._apply_rotary_pos_emb(q, cos, sin)
-        if past_key_value is not None:
+        if past_cache is not None:
             cos = cos[:, -1:, :]
             sin = sin[:, -1:, :]
         k = self._apply_rotary_pos_emb(k, cos, sin)
 
-        if past_key_value is not None:
-            past_k, past_v = past_key_value
+        if past_cache is not None:
+            past_k, past_v = past_cache
             k = torch.cat([past_k, k], dim=2)
             v = torch.cat([past_v, v], dim=2)
-        new_kv_value = (k, v) if use_cache else None
+        new_cache = (k, v) if use_cache else None
 
         if self.n_kv_heads < self.n_heads:
             num_repeat = self.n_heads // self.n_kv_heads
             k = k.repeat_interleave(num_repeat, dim=1)
             v = v.repeat_interleave(num_repeat, dim=1)
 
-
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.o_proj(y)
 
-        return y, new_kv_value
+        return y, new_cache
 
     @staticmethod
     def _apply_rotary_pos_emb(x, cos, sin):
@@ -94,8 +102,9 @@ class CausalSelfAttention(nn.Module):
     @staticmethod
     def _rotate_half(x):
         x1 = x[..., : x.shape[-1] // 2]
-        x2 = x[..., x.shape[-1] // 2 :]
+        x2 = x[..., x.shape[-1] // 2:]
         return torch.cat((-x2, x1), dim=-1)
+
 
 class RMSNorm(nn.Module):
     def __init__(self, n_embed, eps=1e-6):
@@ -131,11 +140,11 @@ class Block(nn.Module):
         self.post_attention_layernorm = RMSNorm(n_embed=n_embed, eps=eps)
         self.mlp = MLP(config)
 
-    def forward(self, x, cos, sin, past_kv=None, use_cache=False):
-        attn_out, current_kv = self.self_attn(self.input_layernorm(x), cos, sin, past_kv, use_cache)
+    def forward(self, x, cos, sin, past_cache, use_cache):
+        attn_out, present_cache = self.self_attn(self.input_layernorm(x), cos, sin, past_cache, use_cache)
         x = x + attn_out
         x = x + self.mlp(self.post_attention_layernorm(x))
-        return x, current_kv
+        return x, present_cache
 
 
 class Qwen2(nn.Module, BaseModel):
@@ -143,10 +152,10 @@ class Qwen2(nn.Module, BaseModel):
         super().__init__()
         self.config = config
         self.model = nn.ModuleDict(dict(
-                    embed_tokens = nn.Embedding(config.vocab_size, config.n_embed),
-                    rotary_emb = RotaryEmbedding(config),
-                    layers = nn.ModuleList(Block(config) for _ in range(config.n_layer)),
-                    norm = RMSNorm(config.n_embed, eps=config.rms_norm_eps)
+            embed_tokens=nn.Embedding(config.vocab_size, config.n_embed),
+            rotary_emb=RotaryEmbedding(config),
+            layers=nn.ModuleList(Block(config) for _ in range(config.n_layer)),
+            norm=RMSNorm(config.n_embed, eps=config.rms_norm_eps)
         ))
         self.lm_head = None
         if not config.tie_word_embeddings:
@@ -160,16 +169,25 @@ class Qwen2(nn.Module, BaseModel):
         position_ids = position_ids.unsqueeze(0).expand(B, -1)
         return position_ids
 
-    def forward(self, input_ids: torch.Tensor, kv_cache=None, targets=None):
+    def forward(self, input_ids: torch.LongTensor,
+                target: Optional[torch.LongTensor] = None,
+                use_cache: Optional[bool] = None,
+                past_cache: Optional[List[Cache]] = None,
+                ):
+        if target is not None and use_cache :
+            log.error('use_cache=True не совместим с обучением. Выставите use_cache=False')
+            raise 'use_cache=True. Must by False'
+        use_cache = False if use_cache is None else use_cache
+
         x = self.model.embed_tokens(input_ids)
         position_ids = self._get_position_ids(input_ids)
         cos, sin = self.model.rotary_emb(x, position_ids)
 
-        new_kv_cache = [] if kv_cache is None else kv_cache
+        new_cache: List[Cache] = []
         for i, layer in enumerate(self.model.layers):
-            past_key_value = None if kv_cache is None else kv_cache[i]
-            x, past_key_value = layer(x, cos, sin, past_key_value)
-            new_kv_cache.append(past_key_value)
+            current_cache = None if past_cache is None else self._get_kv_cache(past_cache[i], input_ids.device)
+            x, present_cache = layer(x, cos, sin, current_cache, use_cache)
+            self._set_cache(new_cache, present_cache)
 
         x = self.model.norm(x)
 
@@ -179,54 +197,27 @@ class Qwen2(nn.Module, BaseModel):
             logits = self.lm_head(x)
 
         loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-
-        return logits, new_kv_cache, loss
-
-    def generate(
-        self, input_ids: torch.Tensor, callback: Callable[[int], bool]= None, max_new_tokens: int = 1000, use_cache=True
-    ) -> torch.Tensor:
-        cache = [None] * len(self.model.layers)
-        for _ in range(max_new_tokens):
-            x = self.model.embed_tokens(input_ids)
-            position_ids = self._get_position_ids(input_ids)
-            cos, sin = self.model.rotary_emb(x, position_ids)
-            new_cache = [None] * len(self.model.layers)
-            for layer, layer_cache in zip(self.model.layers, cache):
-                layer_cache = self._get_kv_cache(layer_cache, x.device)
-                x, present = layer(x, cos, sin, layer_cache, use_cache)
-                self._set_kv_cache(new_cache, present)
-            cache = new_cache
-            x = self.model.norm(x)
-            if self.lm_head is None:
-                logits = torch.matmul(x, self.model.embed_tokens.weight.T)
-            else:
-                logits = self.lm_head(x)
-            last_logits = logits[:, -1, :]
-            probs = F.softmax(last_logits, dim=-1)
-            next_token = probs.argmax(dim=-1, keepdim=True)
-            input_ids = torch.cat([input_ids, next_token], dim=1)
-            if callback is not None:
-                if callback(next_token):
-                    return input_ids
-        return input_ids
+        if target is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target.view(-1))
+        new_cache = new_cache if use_cache else None
+        return logits, loss, new_cache
 
     @staticmethod
-    def _set_kv_cache(past_cache, new_tensor):
-        if new_tensor is not None:
-            present = (
-                new_tensor[0].detach().cpu(),
-                new_tensor[1].detach().cpu()
+    def _set_cache(cache, new_cache):
+        if new_cache is not None:
+            present = Cache(
+                new_cache[0].detach().cpu(),
+                new_cache[1].detach().cpu()
             )
-            past_cache.append(present)
+            cache.append(present)
 
     @staticmethod
-    def _get_kv_cache(past_cache, device):
-        if past_cache is not None:
-            cache = (
-                past_cache[0].to(device),
-                past_cache[1].to(device)
+    def _get_kv_cache(cache, device):
+        if cache is not None:
+            cache_on_device = (
+                cache.key_cache.to(device),
+                cache.value_cache.to(device)
             )
-            return cache
+            return cache_on_device
         return None
+

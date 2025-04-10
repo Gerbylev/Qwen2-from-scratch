@@ -9,7 +9,7 @@ from safetensors.torch import save_file
 from huggingface_hub import snapshot_download, HfApi
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
-from models.conf import ModelConfig
+from model.conf import ModelConfig
 
 
 def _get_model_config_by_hf_config(hf_config: dict, dataclass_type: dataclass) -> dict:
