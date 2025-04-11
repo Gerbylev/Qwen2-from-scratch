@@ -1,15 +1,16 @@
 import os
 import json
+import shutil
 from pathlib import Path
 from typing import Optional, Union, Dict
 import torch
 from dataclasses import dataclass
 
 from safetensors.torch import save_file
-from huggingface_hub import snapshot_download, HfApi
+from huggingface_hub import snapshot_download, HfApi, Repository
 from accelerate import init_empty_weights, load_checkpoint_and_dispatch
 
-from model.conf import ModelConfig
+from models.conf import ModelConfig
 
 
 def _get_model_config_by_hf_config(hf_config: dict, dataclass_type: dataclass) -> dict:
@@ -72,38 +73,21 @@ class BaseModel:
     def save_pretrained(
             self,
             save_directory: Union[str, Path],
-            config: Optional[ModelConfig] = None,
+            original_repo_id: str,
             push_to_hub: bool = False,
             repo_id: Optional[str] = None,
             token: Optional[str] = None,
     ):
-        save_directory = Path(save_directory)
-        save_directory.mkdir(parents=True, exist_ok=True)
+        local_save_directory = Path(save_directory)
+        local_save_directory.mkdir(exist_ok=True, parents=True)
 
-        self._save_pretrained(save_directory)
-
-        config = config or getattr(self, "config", None)
-        if config is not None:
-            (save_directory / "config.json").write_text(
-                json.dumps(config.__dict__, indent=2)
-            )
-
-        if push_to_hub and repo_id:
-            HfApi(token=token).upload_folder(
-                folder_path=str(save_directory),
-                repo_id=repo_id,
-                repo_type="model",
-                token=token,
-            )
-
-    def _save_pretrained(self, save_directory: Path):
         state_dict = self.state_dict()
-        split_size = 3 * 1024 * 1024 * 1024  # 3GB
+        split_size = 3 * 1024 * 1024 * 1024  # размер чанка: 3 ГБ
         tensors, current_size, file_index = {}, 0, 1
 
         def write_chunk():
             nonlocal tensors, current_size, file_index
-            save_path = save_directory / f"model-{file_index:05d}-of-xxxx.safetensors"
+            save_path = local_save_directory / f"model-{file_index:05d}-of-xxxx.safetensors"
             save_file(tensors, save_path)
             file_index += 1
             return {}, 0
@@ -119,7 +103,45 @@ class BaseModel:
             tensors, current_size = write_chunk()
 
         total_files = file_index - 1
-        for idx in range(1, total_files + 1):
-            old_name = save_directory / f"model-{idx:05d}-of-xxxx.safetensors"
-            new_name = save_directory / f"model-{idx:05d}-of-{total_files:05d}.safetensors"
+        if total_files == 1:
+            old_name = local_save_directory / f"model-{1:05d}-of-xxxx.safetensors"
+            new_name = local_save_directory / f"model.safetensors"
             old_name.rename(new_name)
+        else:
+            for idx in range(1, total_files + 1):
+                old_name = local_save_directory / f"model-{idx:05d}-of-xxxx.safetensors"
+                new_name = local_save_directory / f"model-{idx:05d}-of-{total_files:05d}.safetensors"
+                old_name.rename(new_name)
+
+
+        repo_dir =  Path(
+            snapshot_download(
+                repo_id=original_repo_id
+            )
+        )
+
+        weight_extensions = {".safetensors", ".bin", ".pt"}
+        for file in repo_dir.iterdir():
+            if file.is_file() and (file.suffix.lower() not in weight_extensions):
+                shutil.copy(file, local_save_directory / file.name)
+
+        print(f"Модель успешно сохранена локально в {local_save_directory}")
+
+        if push_to_hub:
+            if not repo_id or not token:
+                raise ValueError("При загрузке на HF Hub необходимо указать repo_id и token.")
+
+            git_dir = local_save_directory / ".git"
+            if not git_dir.exists():
+                os.system(f"cd {local_save_directory} && rm -rf .git ")
+                os.system(f"cd {local_save_directory} && rm -rf .gitattributes")
+
+            api = HfApi(token=token)
+            api.upload_folder(
+                folder_path=str(local_save_directory),
+                repo_id=repo_id,
+                repo_type="model",
+                token=token,
+            )
+
+            print(f"Модель успешно опубликована на Hugging Face Hub: https://huggingface.co/{repo_id}")

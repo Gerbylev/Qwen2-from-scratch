@@ -3,7 +3,7 @@ from typing import List, Union,Optional
 from typing import Callable
 from transformers import AutoTokenizer
 
-from model.model import Qwen2
+from models.model import Qwen2
 
 
 def wrap_messages(messages: List[dict]) -> str:

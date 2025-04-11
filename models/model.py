@@ -7,8 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sympy.physics.units import current
 
-from model.conf import ModelConfig
-from model.base import BaseModel
+from models.conf import ModelConfig
+from models.base import BaseModel
 
 log = logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 

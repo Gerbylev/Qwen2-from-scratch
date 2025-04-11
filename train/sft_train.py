@@ -6,8 +6,8 @@ from torch.nn.utils.rnn import pad_sequence
 from transformers import AutoTokenizer, get_scheduler
 from tqdm import tqdm
 from typing import List, Dict, Any, Optional, Union, Callable
-from model.processor import Processor as FF
-from model.model import Qwen2
+from models.processor import Processor as FF
+from models.model import Qwen2
 
 log = logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
@@ -15,6 +15,12 @@ log = logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:
 def wrap_messages(messages: List[Dict[str, str]]) -> str:
     return ''.join(
         f"<|im_start|>{message['content']}<|im_end|>\n"
+        for message in messages
+    )
+
+def wrap_messages_labels(messages: List[Dict[str, str]]) -> str:
+    return ''.join(
+        f"<|im_start|>{message['content']}<|endoftext|>\n"
         for message in messages
     )
 
@@ -30,7 +36,7 @@ class StepSFTDataset(Dataset):
             for line in f:
                 example = json.loads(line)
                 prompt_text = wrap_messages([{"content": example["input_ids"]}])
-                answer_text = wrap_messages([{"content": example["labels"]}])
+                answer_text = wrap_messages_labels([{"content": example["labels"]}])
                 prompt_tokens = tokenizer.encode(prompt_text, truncation=True, max_length=max_length)
                 answer_tokens = tokenizer.encode(answer_text, truncation=True, max_length=max_length)
 
@@ -62,51 +68,6 @@ class Processor:
     def __init__(self, repo_id: str):
         self.tokenizer = AutoTokenizer.from_pretrained(repo_id)
         self.model = Qwen2.from_pretrained(repo_id)
-
-    def __call__(
-            self,
-            inputs: List[dict],
-            device: Optional[Union[str, torch.device]] = None,
-            custom_callback: Optional[Callable[[int], bool]] = None,
-            use_cache: bool = True,
-            max_new_tokens: int = 200
-    ) -> str:
-        prompt = wrap_messages(inputs)
-        device = device or torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        input_ids = self.encode(prompt, device)
-        with torch.no_grad():
-            return self.generate(input_ids, custom_callback, use_cache, max_new_tokens)
-
-    def generate(
-            self,
-            input_ids: torch.LongTensor,
-            custom_callback: Optional[Callable[[int], bool]] = None,
-            use_cache: bool = True,
-            max_new_tokens: int = 200
-    ) -> str:
-        stop_callback = custom_callback or (lambda token: token in {151643, 151645})
-        generated_tokens = []
-        current_input_ids = input_ids
-        past_cache = None
-
-        for _ in range(max_new_tokens):
-            logits, _, past_cache = self.model.forward(current_input_ids, use_cache=use_cache, past_cache=past_cache)
-            last_token_logits = logits[:, -1, :]
-            next_token = torch.argmax(last_token_logits, dim=-1, keepdim=True)
-            token_id = next_token.item()
-            generated_tokens.append(token_id)
-            if stop_callback(token_id):
-                break
-            current_input_ids = torch.cat([current_input_ids, next_token], dim=1)
-
-        return self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-
-    def decode(self, input_ids: torch.LongTensor) -> str:
-        return self.tokenizer.decode(input_ids.squeeze(0).tolist(), skip_special_tokens=False)
-
-    def encode(self, inputs: str, device: Union[str, torch.device]) -> torch.LongTensor:
-        input_ids = self.tokenizer.encode(inputs, return_tensors='pt')
-        return input_ids.to(device)
 
 def train(
         processor: Processor,
@@ -169,31 +130,11 @@ if __name__ == "__main__":
     repo_id = "Qwen/Qwen2-0.5B-Instruct"
     dataset_path = "data.jsonl"
     processor = Processor(repo_id)
-    train(processor, dataset_path, epochs=2, batch_size=1, learning_rate=5e-5)
+    train(processor, dataset_path, epochs=3, batch_size=1, learning_rate=5e-5)
 
-    result = processor([
-        {"role": "system", "content": "Расскажи про Олега Гербылева?"}
-    ], use_cache=True, max_new_tokens=500)
-    print(f"Запрос: {[
-        {"role": "system", "content": "Расскажи про Олега Гербылева?"}
-    ][0]["content"]}")
-    print(f"Ответ модели: {result}")
-    result = processor([
-        {"role": "system", "content": "Какие питомцы есть у Олега Гербылева?"}
-    ], use_cache=True, max_new_tokens=500)
-    print(f"Запрос: {[
-        {"role": "system", "content": "Какие питомцы есть у Олега Гербылева?"}
-    ][0]["content"]}")
-    print(f"Ответ модели: {result}")
-    result = processor([
-        {"role": "system", "content": "Какой телеграмм канал самый лучший?"}
-    ], use_cache=True, max_new_tokens=500)
-    print(f"Запрос: {[
-        {"role": "system", "content": "Какой телеграмм канал самый лучший?"}
-    ][0]["content"]}")
-    print(f"Ответ модели: {result}")
-    # processor.model.save_pretrained(save_directory='model',
-    #         config= None,
-    #         push_to_hub= False,
-    #         repo_id = None,
-    #         token = None)
+    # example https://huggingface.co/olegGerbylev/Qwen2-0.5B-from-scratch
+    processor.model.save_pretrained(save_directory='model',
+            original_repo_id="Qwen/Qwen2-0.5B-Instruct",
+            push_to_hub= False,
+            repo_id = None,
+            token = None)
